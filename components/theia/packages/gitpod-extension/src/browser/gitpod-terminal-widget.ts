@@ -40,13 +40,6 @@ export class GitpodTerminalWidget extends TerminalWidgetImpl {
         this.oldState = oldState;
     }
 
-    public getTerminalId(): number | undefined {
-        if (this.terminalId) {
-            return this.terminalId;
-        }
-        return this.oldState && this.oldState.terminalId;
-    }
-
     async start(id?: number): Promise<number> {
         if (id === undefined && this.oldState !== undefined) {
             super.restoreState(this.oldState);
