@@ -16,6 +16,7 @@ import (
 	"github.com/gitpod-io/gitpod/ws-manager-node/pkg/dispatch"
 	"github.com/gitpod-io/gitpod/ws-manager-node/pkg/hostsgov"
 	"github.com/gitpod-io/gitpod/ws-manager-node/pkg/resourcegov"
+	"github.com/gitpod-io/gitpod/ws-manager-node/pkg/uidmap"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/xerrors"
 	"k8s.io/client-go/kubernetes"
@@ -38,6 +39,7 @@ func New(cfg Configuration, reg prometheus.Registerer) (*Daemon, error) {
 	}
 
 	var listener []dispatch.Listener
+	listener = append(listener, &uidmap.Uidmapper{ProcLocation: "/proc"})
 	if cfg.Resources != nil {
 		listener = append(listener, resourcegov.NewDispatchListener(cfg.Resources, reg))
 	}
@@ -145,6 +147,7 @@ func (d *Daemon) Start() {
 	if err != nil {
 		log.WithError(err).Fatal("cannot start dispatch")
 	}
+	log.Info("started workspace dispatch")
 
 	for _, g := range d.DiskGuards {
 		go g.Start(30 * time.Second)

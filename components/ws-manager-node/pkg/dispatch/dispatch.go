@@ -1,7 +1,12 @@
+// Copyright (c) 2020 TypeFox GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License-AGPL.txt in the project root for license information.
+
 package dispatch
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -46,6 +51,7 @@ func NewDispatch(runtime cri.ContainerRuntimeInterface, kubernetes kubernetes.In
 		Kubernetes:          kubernetes,
 		KubernetesNamespace: k8sNamespace,
 		Listener:            listener,
+		NodeName:            os.Getenv("NODENAME"),
 
 		ctxs: make(map[string]*workspaceState),
 	}
@@ -60,6 +66,7 @@ type Dispatch struct {
 	CRI                 cri.ContainerRuntimeInterface
 	Kubernetes          kubernetes.Interface
 	KubernetesNamespace string
+	NodeName            string
 
 	Listener []Listener
 
@@ -159,6 +166,12 @@ func (d *Dispatch) handlePodAdded(pod *corev1.Pod) {
 		return
 	}
 
+	if d.NodeName != "" && pod.Spec.NodeName != d.NodeName {
+		return
+	}
+
+	log.WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).Info("dispatch found new workspace")
+
 	waitForPodCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	containerCtx, containerCtxCancel := context.WithCancel(context.Background())
 	containerCtx = context.WithValue(containerCtx, contextDispatch, d)
@@ -183,6 +196,7 @@ func (d *Dispatch) handlePodAdded(pod *corev1.Pod) {
 		}
 		d.mu.Unlock()
 
+		log.WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).WithField("container", containerID).Info("dispatch found new workspace container")
 		for _, l := range d.Listener {
 			l := l
 			go func() {
@@ -194,19 +208,15 @@ func (d *Dispatch) handlePodAdded(pod *corev1.Pod) {
 		}
 	}()
 	go func() {
-		err := d.CRI.WaitForContainerStop(waitForPodCtx, workspaceInstanceID)
-		if err != nil && err != context.Canceled {
-			log.WithError(err).WithFields(wsk8s.GetOWIFromObject(&pod.ObjectMeta)).Warn("cannot wait for container to be deleted")
-		}
 		// no matter if the container was deleted or not - we've lost our guard that was waiting for that to happen.
 		// Hence, we must stop listening for it to come into existence and cancel the context.
+		d.CRI.WaitForContainerStop(waitForPodCtx, workspaceInstanceID)
 		cancel()
 	}()
 }
 
 func (d *Dispatch) handlePodUpdate(oldPod, newPod *corev1.Pod) {
 	if _, ok := oldPod.Labels[wsk8s.MetaIDLabel]; !ok {
-		log.WithField("name", oldPod.Name).Debug("pod has no workspace ID - probably not a workspace. Not dispatching.")
 		return
 	}
 
@@ -215,8 +225,11 @@ func (d *Dispatch) handlePodUpdate(oldPod, newPod *corev1.Pod) {
 
 	state, ok := d.ctxs[oldPod.Name]
 	if !ok {
-		log.WithFields(wsk8s.GetOWIFromObject(&oldPod.ObjectMeta)).Error("received pod update for a workspace, but have not seen it before. Ignoring update.")
+		// we're receiving pod updates for something that doesn't have a ready container yet
+		return
 	}
+	log.WithFields(wsk8s.GetOWIFromObject(&oldPod.ObjectMeta)).Info("received received pod update for a workspace")
+
 	state.Workspace.Pod = newPod
 
 	for _, l := range d.Listener {

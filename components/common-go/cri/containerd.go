@@ -13,6 +13,7 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/api/events"
+	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/typeurl"
@@ -90,6 +91,7 @@ type containerInfo struct {
 	SeenTask    bool
 	UpperDir    string
 	CGroupPath  string
+	PID         uint32
 }
 
 // start listening to containerd
@@ -103,6 +105,13 @@ func (s *ContainerdCRI) start() error {
 	}
 	for _, c := range cs {
 		s.handleNewContainer(c)
+	}
+	ts, err := s.Client.TaskService().List(ctx, &tasks.ListTasksRequest{})
+	if err != nil {
+		return xerrors.Errorf("cannot list tasks: %w", err)
+	}
+	for _, t := range ts.Tasks {
+		s.handleNewTask(t.ContainerID, nil, t.Pid)
 	}
 
 	// Using the filter expression for subscribe does not seem to work. We simply don't get any events.
@@ -141,7 +150,7 @@ func (s *ContainerdCRI) handleContainerdEvent(ev interface{}) {
 		}
 		s.handleNewContainer(c)
 	case *events.TaskCreate:
-		s.handleNewTask(evt.ContainerID, evt.Rootfs)
+		s.handleNewTask(evt.ContainerID, evt.Rootfs, evt.Pid)
 
 	case *events.TaskDelete:
 
@@ -206,14 +215,31 @@ func (s *ContainerdCRI) handleNewContainer(c containers.Container) {
 	}
 }
 
-func (s *ContainerdCRI) handleNewTask(cid string, rootfs []*types.Mount) {
+func (s *ContainerdCRI) handleNewTask(cid string, rootfs []*types.Mount, pid uint32) {
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
 
 	info, ok := s.cntIdx[cid]
 	if !ok {
 		// we don't care for this task
+		log.WithField("containerID", cid).Debug("got no container info for this task - not handling")
 		return
+	}
+
+	if rootfs == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		mnts, err := s.Client.SnapshotService("overlay").Mounts(ctx, cid)
+		cancel()
+		if err != nil {
+			log.WithError(err).Warnf("cannot get mounts for container %v", cid)
+		}
+		for _, m := range mnts {
+			rootfs = append(rootfs, &types.Mount{
+				Source:  m.Source,
+				Options: m.Options,
+				Type:    m.Type,
+			})
+		}
 	}
 
 	for _, rfs := range rootfs {
@@ -232,6 +258,7 @@ func (s *ContainerdCRI) handleNewTask(cid string, rootfs []*types.Mount) {
 		}
 	}
 
+	info.PID = pid
 	info.SeenTask = true
 
 	log.WithFields(log.OWI(info.OwnerID, info.WorkspaceID, info.InstanceID)).WithField("cid", cid).WithField("upperdir", info.UpperDir).Debug("found task")
@@ -339,7 +366,7 @@ func (s *ContainerdCRI) ContainerUpperdir(ctx context.Context, id ContainerID) (
 	return s.Mapping.Translate(info.UpperDir)
 }
 
-// ContainerCGroupPath finds the container's cgroup path on the node.
+// ContainerCGroupPath finds the container's cgroup path suffix
 func (s *ContainerdCRI) ContainerCGroupPath(ctx context.Context, id ContainerID) (loc string, err error) {
 	info, ok := s.cntIdx[string(id)]
 	if !ok {
@@ -350,7 +377,17 @@ func (s *ContainerdCRI) ContainerCGroupPath(ctx context.Context, id ContainerID)
 		return "", ErrNoCGroup
 	}
 
-	return s.Mapping.Translate(info.CGroupPath)
+	return info.CGroupPath, nil
+}
+
+// ContainerPID finds the workspace container's PID
+func (s *ContainerdCRI) ContainerPID(ctx context.Context, id ContainerID) (pid uint64, err error) {
+	info, ok := s.cntIdx[string(id)]
+	if !ok {
+		return 0, ErrNotFound
+	}
+
+	return uint64(info.PID), nil
 }
 
 // ExtractCGroupPathFromContainer retrieves the CGroupPath from the linux section
